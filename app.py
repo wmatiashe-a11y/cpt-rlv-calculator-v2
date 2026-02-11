@@ -16,7 +16,7 @@ DC_BASE_RATE = 514.10  # Total DC per m2
 ROADS_TRANSPORT_PORTION = 285.35
 
 IH_PRICE_PER_M2 = 15000            # capped IH price (assumption)
-DEFAULT_PROF_FEE_RATE = 0.12       # % of (construction + DCs) when fees are NOT included in build cost
+DEFAULT_PROF_FEE_RATE = 0.12       # % of (construction + DCs)
 
 st.set_page_config(page_title="CPT RLV Calculator", layout="wide")
 st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
@@ -27,36 +27,42 @@ st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
 @dataclass(frozen=True)
 class HeritageOverlay:
     enabled: bool
-    bulk_reduction_pct: float      # interpreted as "BONUS suppression %" (override bonus)
-    cost_uplift_pct: float         # increases construction costs
-    fees_uplift_pct: float         # increases professional fees rate (ignored if build cost is all-in)
+    bulk_reduction_pct: float      # interpreted as "BONUS suppression %"
+    cost_uplift_pct: float         # increases construction costs (or cost % of GDV)
+    fees_uplift_pct: float         # increases professional fees rate
     profit_uplift_pct: float       # increases required profit % of GDV
 
 
 def apply_heritage_overlay(
     density_bonus_pct: float,
-    base_cost_sqm: float,
+    base_cost_value: float,
     base_fees_rate: float,
     base_profit_rate: float,
     overlay: HeritageOverlay,
 ) -> tuple[float, float, float, float]:
     """
     Returns:
-      (adj_density_bonus_pct, adj_cost_sqm, adj_fees_rate, adj_profit_rate)
+      (adj_density_bonus_pct, adj_cost_value, adj_fees_rate, adj_profit_rate)
 
     Heritage behavior:
-    - Suppresses density bonus (instead of scaling down bulk).
-    - bulk_reduction_pct interpreted as "bonus suppression %".
+    - Overrides/suppresses density bonus rather than scaling down bulk.
+    - overlay.bulk_reduction_pct interpreted as "bonus suppression %".
+    - cost_uplift_pct applies to the chosen construction cost input:
+        - if input is R/m² -> uplifts R/m²
+        - if input is % of GDV -> uplifts the % of GDV
     """
     if not overlay.enabled:
-        return density_bonus_pct, base_cost_sqm, base_fees_rate, base_profit_rate
+        return density_bonus_pct, base_cost_value, base_fees_rate, base_profit_rate
 
+    # Bonus suppression
     adj_bonus = density_bonus_pct * (1.0 - overlay.bulk_reduction_pct / 100.0)
     adj_bonus = max(0.0, adj_bonus)
 
-    adj_cost = base_cost_sqm * (1.0 + overlay.cost_uplift_pct / 100.0)
+    # Uplifts
+    adj_cost = base_cost_value * (1.0 + overlay.cost_uplift_pct / 100.0)
     adj_fees = base_fees_rate * (1.0 + overlay.fees_uplift_pct / 100.0)
     adj_profit = base_profit_rate * (1.0 + overlay.profit_uplift_pct / 100.0)
+
     return adj_bonus, adj_cost, adj_fees, adj_profit
 
 
@@ -73,19 +79,29 @@ density_bonus = st.sidebar.slider("Density Bonus (%)", 0, 50, 20)
 
 st.sidebar.header("3. Financials (ZAR)")
 market_price = st.sidebar.number_input("Market Sales Price (per m2)", value=35000.0, min_value=0.0, step=500.0)
-const_cost = st.sidebar.number_input("Construction Cost (per m2)", value=17500.0, min_value=0.0, step=250.0)
-profit_margin = st.sidebar.slider("Target Profit (as % of GDV)", 10, 25, 20) / 100
 
-# NEW: All-in toggle
-st.sidebar.markdown("---")
-build_cost_includes_fees = st.sidebar.checkbox(
-    "Construction cost includes professional fees (all-in rate)",
-    value=False,
-    help=(
-        "If enabled, the Construction Cost/m² is treated as an all-in rate that already includes "
-        "professional fees. The model will set professional fees to R0 to avoid double counting."
-    ),
+# ✅ New toggle: construction cost mode
+cost_mode = st.sidebar.radio(
+    "Construction cost input mode",
+    options=["R / m²", "% of GDV"],
+    index=0,
+    help="Choose how you want to input construction costs.",
 )
+
+if cost_mode == "R / m²":
+    const_cost_sqm = st.sidebar.number_input("Construction Cost (per m2)", value=17500.0, min_value=0.0, step=250.0)
+    const_cost_pct_gdv = 0.0  # ignored
+else:
+    const_cost_pct_gdv = st.sidebar.slider(
+        "Construction Cost (% of GDV)",
+        min_value=10,
+        max_value=90,
+        value=50,
+        help="Construction costs as a % of GDV (will be applied after GDV is calculated).",
+    ) / 100.0
+    const_cost_sqm = 0.0  # ignored (we'll compute an implied cost/m² for display)
+
+profit_margin = st.sidebar.slider("Target Profit (as % of GDV)", 10, 25, 20) / 100
 
 # --- BUILT HERITAGE OVERLAY INPUTS ---
 st.sidebar.header("4. Overlays")
@@ -99,22 +115,20 @@ heritage_bonus_suppression = st.sidebar.slider(
     disabled=not heritage_enabled,
     help="0% = full bonus achievable; 100% = bonus fully blocked."
 )
-heritage_cost_uplift = st.sidebar.slider("Construction cost uplift (%)", 0, 40, 8, disabled=not heritage_enabled)
-
-heritage_fees_uplift = st.sidebar.slider(
-    "Professional fees uplift (%)",
-    0, 40, 5,
-    disabled=(not heritage_enabled) or build_cost_includes_fees,
-    help="Disabled when build cost is all-in, because fees are not modelled as a separate line item."
+heritage_cost_uplift = st.sidebar.slider(
+    "Construction cost uplift (%)",
+    0, 40, 8,
+    disabled=not heritage_enabled,
+    help="Uplifts construction input (R/m² or % of GDV)."
 )
-
+heritage_fees_uplift = st.sidebar.slider("Professional fees uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
 heritage_profit_uplift = st.sidebar.slider("Profit requirement uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
 
 heritage_overlay = HeritageOverlay(
     enabled=heritage_enabled,
-    bulk_reduction_pct=float(heritage_bonus_suppression),  # now "bonus suppression"
+    bulk_reduction_pct=float(heritage_bonus_suppression),
     cost_uplift_pct=float(heritage_cost_uplift),
-    fees_uplift_pct=float(heritage_fees_uplift) if not build_cost_includes_fees else 0.0,
+    fees_uplift_pct=float(heritage_fees_uplift),
     profit_uplift_pct=float(heritage_profit_uplift),
 )
 
@@ -137,35 +151,40 @@ def compute_model(
     pt_zone_value: str,
     market_price_per_m2: float,
     ih_price_per_m2: float,
-    const_cost_per_m2: float,
     profit_pct_gdv: float,
     base_prof_fee_rate: float,
     overlay: HeritageOverlay,
-    build_cost_includes_fees: bool,
+    cost_mode: str,
+    base_cost_sqm: float,
+    base_cost_pct_gdv: float,
 ):
     """
     Key rules:
     - Base bulk = land_area * ff
-    - Heritage suppresses density bonus (override), not bulk scaling
+    - Heritage suppresses density bonus (override)
     - Proposed GBA = base_bulk * (1 + effective_bonus)
     - IH applied to net increase (consistent with DC basis)
     - DCs payable on market share of net increase; PT discount on roads portion
-    - Profit = (effective profit rate) * GDV
-    - If build_cost_includes_fees: professional fees = 0 (avoid double-counting)
-      else: prof fees = (effective fee rate) * (construction + DCs)
+    - Construction cost input can be:
+        (A) R/m²: construction_costs = proposed_gba * adj_cost_sqm
+        (B) % of GDV: construction_costs = GDV * adj_cost_pct_gdv
+    - Prof fees = adj_fees_rate * (construction + DCs)
+    - Profit = adj_profit_rate * GDV
     - RLV = GDV - (construction + DCs + prof fees + profit)
     """
 
     base_bulk = land_area_m2 * ff
 
-    # If build cost is all-in, fees are NOT added separately.
-    fees_rate_input = 0.0 if build_cost_includes_fees else base_prof_fee_rate
+    # Apply overlay (bonus override + uplifts)
+    if cost_mode == "R / m²":
+        cost_input = base_cost_sqm
+    else:
+        cost_input = base_cost_pct_gdv
 
-    # Apply overlay (bonus override + cost/fees/profit uplifts)
-    adj_bonus_pct, adj_cost_sqm, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
+    adj_bonus_pct, adj_cost_input, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
         density_bonus_pct=density_bonus_pct,
-        base_cost_sqm=const_cost_per_m2,
-        base_fees_rate=fees_rate_input,
+        base_cost_value=cost_input,
+        base_fees_rate=base_prof_fee_rate,
         base_profit_rate=profit_pct_gdv,
         overlay=overlay,
     )
@@ -194,19 +213,25 @@ def compute_model(
     # Revenue
     gdv = (market_gba * market_price_per_m2) + (ih_gba * ih_price_per_m2)
 
-    # Costs
-    construction_costs = proposed_gba * adj_cost_sqm
-    hard_plus_dc = construction_costs + total_dc
-
-    if build_cost_includes_fees:
-        prof_fees = 0.0
-        effective_fee_rate = 0.0
+    # Construction costs (mode-dependent)
+    if cost_mode == "R / m²":
+        adj_cost_sqm = adj_cost_input
+        construction_costs = proposed_gba * adj_cost_sqm
+        adj_cost_pct_gdv = None
     else:
-        prof_fees = hard_plus_dc * adj_fees_rate
-        effective_fee_rate = adj_fees_rate
+        adj_cost_pct_gdv = adj_cost_input
+        construction_costs = gdv * adj_cost_pct_gdv
+        adj_cost_sqm = None
 
+    # Fees + profit
+    hard_plus_dc = construction_costs + total_dc
+    prof_fees = hard_plus_dc * adj_fees_rate
     profit = gdv * adj_profit_rate
+
     rlv = gdv - (hard_plus_dc + prof_fees + profit)
+
+    # Implied cost per m² for display (useful when input is % of GDV)
+    implied_cost_sqm = (construction_costs / proposed_gba) if proposed_gba > 0 else 0.0
 
     return {
         "base_bulk": base_bulk,
@@ -222,12 +247,15 @@ def compute_model(
         "gdv": gdv,
         "construction_costs": construction_costs,
         "prof_fees": prof_fees,
-        "effective_fee_rate": float(effective_fee_rate),
         "profit": profit,
         "rlv": rlv,
         "brownfield_credit": existing_gba_m2 > proposed_gba,
-        "adj_cost_sqm": adj_cost_sqm,
+        "adj_fees_rate": adj_fees_rate,
         "adj_profit_rate": adj_profit_rate,
+        "cost_mode": cost_mode,
+        "adj_cost_sqm": adj_cost_sqm,
+        "adj_cost_pct_gdv": adj_cost_pct_gdv,
+        "implied_cost_sqm": implied_cost_sqm,
     }
 
 
@@ -243,11 +271,12 @@ res = compute_model(
     pt_zone_value=pt_zone,
     market_price_per_m2=market_price,
     ih_price_per_m2=IH_PRICE_PER_M2,
-    const_cost_per_m2=const_cost,
     profit_pct_gdv=profit_margin,
     base_prof_fee_rate=DEFAULT_PROF_FEE_RATE,
     overlay=heritage_overlay,
-    build_cost_includes_fees=build_cost_includes_fees,
+    cost_mode=cost_mode,
+    base_cost_sqm=const_cost_sqm,
+    base_cost_pct_gdv=const_cost_pct_gdv,
 )
 
 # --- UI DISPLAY ---
@@ -266,15 +295,21 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     if res["brownfield_credit"]:
         st.warning("⚠️ Existing GBA exceeds proposed GBA. Net increase is zero; no DCs payable (Brownfield Credit).")
 
-    if build_cost_includes_fees:
-        st.info("🧾 Professional fees are assumed to be included in the Construction Cost/m² (all-in). Fees line item set to R0 to avoid double-counting.")
+    # Construction cost readout (mode-aware)
+    if res["cost_mode"] == "R / m²":
+        st.caption(f"Construction input: **R {res['adj_cost_sqm']:,.0f}/m²**")
+    else:
+        st.caption(
+            f"Construction input: **{(res['adj_cost_pct_gdv']*100):.1f}% of GDV** "
+            f"(implied **R {res['implied_cost_sqm']:,.0f}/m²**)"
+        )
 
     if heritage_overlay.enabled:
         st.info(f"""
 **🏛️ Built Heritage Overlay Active**
 - Bonus suppression: **{heritage_overlay.bulk_reduction_pct:.0f}%** → effective bonus **{res['adj_bonus_pct']:.1f}%** (input was {res['input_bonus_pct']:.1f}%)
-- Cost uplift: **{heritage_overlay.cost_uplift_pct:.0f}%** → **R {res['adj_cost_sqm']:,.0f}/m²**
-- Fees rate used: **{res['effective_fee_rate']*100:.2f}%** {'(all-in mode → 0%)' if build_cost_includes_fees else ''}
+- Construction uplift: **{heritage_overlay.cost_uplift_pct:.0f}%**
+- Fees rate uplift: **{heritage_overlay.fees_uplift_pct:.0f}%** → **{res['adj_fees_rate']*100:.2f}%**
 - Profit uplift: **{heritage_overlay.profit_uplift_pct:.0f}%** → **{res['adj_profit_rate']*100:.2f}%**
 """)
 
@@ -303,7 +338,7 @@ with col2:
     fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-# Sensitivity Matrix (uses same engine + overlay + all-in toggle)
+# Sensitivity Matrix (uses same engine + overlay + cost mode)
 st.subheader("Sensitivity Analysis: IH % vs Density Bonus (overlay-consistent)")
 
 ih_levels = [0, 10, 20, 30]
@@ -322,11 +357,12 @@ for ih in ih_levels:
             pt_zone_value=pt_zone,
             market_price_per_m2=market_price,
             ih_price_per_m2=IH_PRICE_PER_M2,
-            const_cost_per_m2=const_cost,
             profit_pct_gdv=profit_margin,
             base_prof_fee_rate=DEFAULT_PROF_FEE_RATE,
             overlay=heritage_overlay,
-            build_cost_includes_fees=build_cost_includes_fees,
+            cost_mode=cost_mode,
+            base_cost_sqm=const_cost_sqm,
+            base_cost_pct_gdv=const_cost_pct_gdv,
         )
         row.append(f"R {tmp['rlv'] / 1_000_000:.1f}M")
     matrix_data.append(row)
