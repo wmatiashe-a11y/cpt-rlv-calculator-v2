@@ -28,7 +28,7 @@ st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
 class HeritageOverlay:
     enabled: bool
     bulk_reduction_pct: float      # interpreted as "BONUS suppression %"
-    cost_uplift_pct: float         # increases construction costs (or cost % of GDV)
+    cost_uplift_pct: float         # increases construction costs input (R/m² or %GDV)
     fees_uplift_pct: float         # increases professional fees rate
     profit_uplift_pct: float       # increases required profit % of GDV
 
@@ -45,24 +45,18 @@ def apply_heritage_overlay(
       (adj_density_bonus_pct, adj_cost_value, adj_fees_rate, adj_profit_rate)
 
     Heritage behavior:
-    - Overrides/suppresses density bonus rather than scaling down bulk.
-    - overlay.bulk_reduction_pct interpreted as "bonus suppression %".
-    - cost_uplift_pct applies to the chosen construction cost input:
-        - if input is R/m² -> uplifts R/m²
-        - if input is % of GDV -> uplifts the % of GDV
+    - Suppresses density bonus (override)
+    - Uplifts apply to the chosen construction input (R/m² OR % of GDV)
     """
     if not overlay.enabled:
         return density_bonus_pct, base_cost_value, base_fees_rate, base_profit_rate
 
-    # Bonus suppression
     adj_bonus = density_bonus_pct * (1.0 - overlay.bulk_reduction_pct / 100.0)
     adj_bonus = max(0.0, adj_bonus)
 
-    # Uplifts
     adj_cost = base_cost_value * (1.0 + overlay.cost_uplift_pct / 100.0)
     adj_fees = base_fees_rate * (1.0 + overlay.fees_uplift_pct / 100.0)
     adj_profit = base_profit_rate * (1.0 + overlay.profit_uplift_pct / 100.0)
-
     return adj_bonus, adj_cost, adj_fees, adj_profit
 
 
@@ -80,7 +74,7 @@ density_bonus = st.sidebar.slider("Density Bonus (%)", 0, 50, 20)
 st.sidebar.header("3. Financials (ZAR)")
 market_price = st.sidebar.number_input("Market Sales Price (per m2)", value=35000.0, min_value=0.0, step=500.0)
 
-# ✅ New toggle: construction cost mode
+# ✅ Construction cost mode
 cost_mode = st.sidebar.radio(
     "Construction cost input mode",
     options=["R / m²", "% of GDV"],
@@ -88,18 +82,32 @@ cost_mode = st.sidebar.radio(
     help="Choose how you want to input construction costs.",
 )
 
+# ✅ Second toggle only for % of GDV mode
+pct_gdv_scope = "hard_only"
+if cost_mode == "% of GDV":
+    pct_gdv_scope = st.sidebar.radio(
+        "%GDV applies to…",
+        options=["Hard cost only", "Hard + soft (includes prof fees)"],
+        index=0,
+        help=(
+            "Hard cost only: %GDV sets construction (hard) costs, then prof fees are added on top.\n"
+            "Hard + soft: %GDV represents construction + professional fees (all-in), "
+            "so the model avoids double counting fees."
+        ),
+    )
+
 if cost_mode == "R / m²":
     const_cost_sqm = st.sidebar.number_input("Construction Cost (per m2)", value=17500.0, min_value=0.0, step=250.0)
-    const_cost_pct_gdv = 0.0  # ignored
+    const_cost_pct_gdv = 0.0
 else:
     const_cost_pct_gdv = st.sidebar.slider(
         "Construction Cost (% of GDV)",
         min_value=10,
         max_value=90,
         value=50,
-        help="Construction costs as a % of GDV (will be applied after GDV is calculated).",
+        help="Construction costs as a % of GDV (scope depends on the toggle above).",
     ) / 100.0
-    const_cost_sqm = 0.0  # ignored (we'll compute an implied cost/m² for display)
+    const_cost_sqm = 0.0
 
 profit_margin = st.sidebar.slider("Target Profit (as % of GDV)", 10, 25, 20) / 100
 
@@ -157,30 +165,12 @@ def compute_model(
     cost_mode: str,
     base_cost_sqm: float,
     base_cost_pct_gdv: float,
+    pct_gdv_scope: str,
 ):
-    """
-    Key rules:
-    - Base bulk = land_area * ff
-    - Heritage suppresses density bonus (override)
-    - Proposed GBA = base_bulk * (1 + effective_bonus)
-    - IH applied to net increase (consistent with DC basis)
-    - DCs payable on market share of net increase; PT discount on roads portion
-    - Construction cost input can be:
-        (A) R/m²: construction_costs = proposed_gba * adj_cost_sqm
-        (B) % of GDV: construction_costs = GDV * adj_cost_pct_gdv
-    - Prof fees = adj_fees_rate * (construction + DCs)
-    - Profit = adj_profit_rate * GDV
-    - RLV = GDV - (construction + DCs + prof fees + profit)
-    """
-
     base_bulk = land_area_m2 * ff
 
     # Apply overlay (bonus override + uplifts)
-    if cost_mode == "R / m²":
-        cost_input = base_cost_sqm
-    else:
-        cost_input = base_cost_pct_gdv
-
+    cost_input = base_cost_sqm if cost_mode == "R / m²" else base_cost_pct_gdv
     adj_bonus_pct, adj_cost_input, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
         density_bonus_pct=density_bonus_pct,
         base_cost_value=cost_input,
@@ -195,9 +185,7 @@ def compute_model(
     net_increase = max(0.0, proposed_gba - existing_gba_m2)
 
     # IH applied to net increase (consistent with DC basis)
-    ih_gba = net_increase * (ih_pct / 100.0)
-    ih_gba = min(ih_gba, proposed_gba)
-
+    ih_gba = min(net_increase * (ih_pct / 100.0), proposed_gba)
     market_gba = proposed_gba - ih_gba
     market_gba_increase = net_increase - ih_gba
 
@@ -213,24 +201,46 @@ def compute_model(
     # Revenue
     gdv = (market_gba * market_price_per_m2) + (ih_gba * ih_price_per_m2)
 
-    # Construction costs (mode-dependent)
+    # Construction + fees logic (mode + scope dependent)
+    adj_cost_sqm = None
+    adj_cost_pct_gdv = None
+
     if cost_mode == "R / m²":
         adj_cost_sqm = adj_cost_input
         construction_costs = proposed_gba * adj_cost_sqm
-        adj_cost_pct_gdv = None
+        hard_plus_dc = construction_costs + total_dc
+        prof_fees = hard_plus_dc * adj_fees_rate
+
     else:
+        # % of GDV
         adj_cost_pct_gdv = adj_cost_input
-        construction_costs = gdv * adj_cost_pct_gdv
-        adj_cost_sqm = None
 
-    # Fees + profit
-    hard_plus_dc = construction_costs + total_dc
-    prof_fees = hard_plus_dc * adj_fees_rate
+        if pct_gdv_scope == "Hard cost only":
+            # Construction is %GDV (hard), then fees add on top
+            construction_costs = gdv * adj_cost_pct_gdv
+            hard_plus_dc = construction_costs + total_dc
+            prof_fees = hard_plus_dc * adj_fees_rate
+
+        else:
+            # Hard + soft (construction + prof fees) totals to %GDV.
+            # Fees are still computed as a function of (construction + DCs),
+            # so solve without double counting:
+            # Let target_all_in = p * GDV
+            # prof_fees = fee_rate * (construction + DCs)
+            # construction = max(0, target_all_in - prof_fees)
+            # => construction = max(0, p*GDV - fee_rate*(construction + DCs))
+            # => construction*(1 + fee_rate) = p*GDV - fee_rate*DCs
+            target_all_in = gdv * adj_cost_pct_gdv
+            construction_costs = (target_all_in - (adj_fees_rate * total_dc)) / (1.0 + adj_fees_rate)
+            construction_costs = max(0.0, construction_costs)
+
+            hard_plus_dc = construction_costs + total_dc
+            prof_fees = hard_plus_dc * adj_fees_rate
+
+    # Profit + RLV
     profit = gdv * adj_profit_rate
+    rlv = gdv - (construction_costs + total_dc + prof_fees + profit)
 
-    rlv = gdv - (hard_plus_dc + prof_fees + profit)
-
-    # Implied cost per m² for display (useful when input is % of GDV)
     implied_cost_sqm = (construction_costs / proposed_gba) if proposed_gba > 0 else 0.0
 
     return {
@@ -253,6 +263,7 @@ def compute_model(
         "adj_fees_rate": adj_fees_rate,
         "adj_profit_rate": adj_profit_rate,
         "cost_mode": cost_mode,
+        "pct_gdv_scope": pct_gdv_scope,
         "adj_cost_sqm": adj_cost_sqm,
         "adj_cost_pct_gdv": adj_cost_pct_gdv,
         "implied_cost_sqm": implied_cost_sqm,
@@ -277,6 +288,7 @@ res = compute_model(
     cost_mode=cost_mode,
     base_cost_sqm=const_cost_sqm,
     base_cost_pct_gdv=const_cost_pct_gdv,
+    pct_gdv_scope=pct_gdv_scope,
 )
 
 # --- UI DISPLAY ---
@@ -299,8 +311,9 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     if res["cost_mode"] == "R / m²":
         st.caption(f"Construction input: **R {res['adj_cost_sqm']:,.0f}/m²**")
     else:
+        scope_label = "hard only" if res["pct_gdv_scope"] == "Hard cost only" else "hard+soft"
         st.caption(
-            f"Construction input: **{(res['adj_cost_pct_gdv']*100):.1f}% of GDV** "
+            f"Construction input: **{(res['adj_cost_pct_gdv']*100):.1f}% of GDV** ({scope_label}) "
             f"(implied **R {res['implied_cost_sqm']:,.0f}/m²**)"
         )
 
@@ -319,7 +332,6 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     )
 
 with col2:
-    # Waterfall Chart (reconciles to RLV)
     fig = go.Figure(go.Waterfall(
         name="RLV Breakdown",
         orientation="v",
@@ -338,7 +350,7 @@ with col2:
     fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-# Sensitivity Matrix (uses same engine + overlay + cost mode)
+# Sensitivity Matrix (uses same engine + overlay + cost mode + scope)
 st.subheader("Sensitivity Analysis: IH % vs Density Bonus (overlay-consistent)")
 
 ih_levels = [0, 10, 20, 30]
@@ -363,6 +375,7 @@ for ih in ih_levels:
             cost_mode=cost_mode,
             base_cost_sqm=const_cost_sqm,
             base_cost_pct_gdv=const_cost_pct_gdv,
+            pct_gdv_scope=pct_gdv_scope,
         )
         row.append(f"R {tmp['rlv'] / 1_000_000:.1f}M")
     matrix_data.append(row)
