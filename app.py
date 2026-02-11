@@ -15,8 +15,8 @@ ZONING_PRESETS = {
 DC_BASE_RATE = 514.10  # Total DC per m2
 ROADS_TRANSPORT_PORTION = 285.35
 
-IH_PRICE_PER_M2 = 15000  # capped IH price (assumption)
-DEFAULT_PROF_FEE_RATE = 0.12  # % of (construction + DCs)
+IH_PRICE_PER_M2 = 15000            # capped IH price (assumption)
+DEFAULT_PROF_FEE_RATE = 0.12       # % of (construction + DCs)
 
 st.set_page_config(page_title="CPT RLV Calculator", layout="wide")
 st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
@@ -27,14 +27,14 @@ st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
 @dataclass(frozen=True)
 class HeritageOverlay:
     enabled: bool
-    bulk_reduction_pct: float      # reduces achievable bulk (a proxy for restrictions)
-    cost_uplift_pct: float         # increases construction costs (specialist methods/materials)
-    fees_uplift_pct: float         # increases professional fees
-    profit_uplift_pct: float       # increases required profit/contingency due to approval risk
+    bulk_reduction_pct: float      # repurposed as "BONUS suppression %" (override bonus)
+    cost_uplift_pct: float         # increases construction costs
+    fees_uplift_pct: float         # increases professional fees rate
+    profit_uplift_pct: float       # increases required profit % of GDV
 
 
 def apply_heritage_overlay(
-    total_bulk: float,
+    density_bonus_pct: float,
     base_cost_sqm: float,
     base_fees_rate: float,
     base_profit_rate: float,
@@ -42,16 +42,23 @@ def apply_heritage_overlay(
 ) -> tuple[float, float, float, float]:
     """
     Returns:
-      (adj_total_bulk, adj_cost_sqm, adj_fees_rate, adj_profit_rate)
+      (adj_density_bonus_pct, adj_cost_sqm, adj_fees_rate, adj_profit_rate)
+
+    Heritage behavior:
+    - Overrides/suppresses density bonus rather than scaling down bulk.
+    - overlay.bulk_reduction_pct interpreted as "bonus suppression %".
+      e.g. 50% suppression -> only half the density bonus is achievable.
     """
     if not overlay.enabled:
-        return total_bulk, base_cost_sqm, base_fees_rate, base_profit_rate
+        return density_bonus_pct, base_cost_sqm, base_fees_rate, base_profit_rate
 
-    adj_bulk = total_bulk * (1.0 - overlay.bulk_reduction_pct / 100.0)
+    adj_bonus = density_bonus_pct * (1.0 - overlay.bulk_reduction_pct / 100.0)
+    adj_bonus = max(0.0, adj_bonus)
+
     adj_cost = base_cost_sqm * (1.0 + overlay.cost_uplift_pct / 100.0)
     adj_fees = base_fees_rate * (1.0 + overlay.fees_uplift_pct / 100.0)
     adj_profit = base_profit_rate * (1.0 + overlay.profit_uplift_pct / 100.0)
-    return adj_bulk, adj_cost, adj_fees, adj_profit
+    return adj_bonus, adj_cost, adj_fees, adj_profit
 
 
 # --- SIDEBAR INPUTS ---
@@ -76,15 +83,19 @@ st.sidebar.subheader("🏛️ Built Heritage Overlay")
 
 heritage_enabled = st.sidebar.checkbox("Enable Built Heritage Overlay", value=False)
 
-# sensible defaults (edit any time)
-heritage_bulk_reduction = st.sidebar.slider("Bulk reduction (%)", 0, 40, 10, disabled=not heritage_enabled)
+heritage_bonus_suppression = st.sidebar.slider(
+    "Bonus suppression (%)",
+    0, 100, 50,
+    disabled=not heritage_enabled,
+    help="0% = full bonus achievable; 100% = bonus fully blocked."
+)
 heritage_cost_uplift = st.sidebar.slider("Construction cost uplift (%)", 0, 40, 8, disabled=not heritage_enabled)
 heritage_fees_uplift = st.sidebar.slider("Professional fees uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
 heritage_profit_uplift = st.sidebar.slider("Profit requirement uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
 
 heritage_overlay = HeritageOverlay(
     enabled=heritage_enabled,
-    bulk_reduction_pct=float(heritage_bulk_reduction),
+    bulk_reduction_pct=float(heritage_bonus_suppression),  # now "bonus suppression"
     cost_uplift_pct=float(heritage_cost_uplift),
     fees_uplift_pct=float(heritage_fees_uplift),
     profit_uplift_pct=float(heritage_profit_uplift),
@@ -115,44 +126,41 @@ def compute_model(
     overlay: HeritageOverlay,
 ):
     """
-    Consistent assumptions:
+    Key rules:
     - Base bulk = land_area * ff
-    - Density bonus increases bulk before overlay; heritage overlay then reduces achievable bulk
-    - Proposed GBA derived from (base bulk * (1 + bonus)) then adjusted by overlay bulk reduction
-    - IH applied to net increase (brownfield credit basis) to stay consistent with DCs
-    - DCs payable on market share of net increase; PT discount applied to roads portion only
-    - Profit = profit_pct_gdv * GDV (then uplifted by overlay)
-    - Prof fees rate uplifted by overlay
+    - Heritage suppresses density bonus (override), rather than scaling bulk down
+    - Proposed GBA = base_bulk * (1 + effective_bonus)
+    - IH applied to net increase (consistent with DC basis)
+    - DCs payable on market share of net increase; PT discount on roads portion
+    - Profit = (effective profit rate) * GDV
+    - Prof fees = (effective fee rate) * (construction + DCs)
     - RLV = GDV - (construction + DCs + prof fees + profit)
     """
 
-    # 1) Base + density bonus
     base_bulk = land_area_m2 * ff
-    bulk_with_bonus = base_bulk * (1.0 + density_bonus_pct / 100.0)
 
-    # 2) Apply overlay adjustments (bulk, cost, fees rate, profit rate)
-    adj_bulk, adj_cost_sqm, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
-        total_bulk=bulk_with_bonus,
+    # Apply overlay (bonus override + uplifts)
+    adj_bonus_pct, adj_cost_sqm, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
+        density_bonus_pct=density_bonus_pct,
         base_cost_sqm=const_cost_per_m2,
         base_fees_rate=base_prof_fee_rate,
         base_profit_rate=profit_pct_gdv,
         overlay=overlay,
     )
 
-    proposed_gba = adj_bulk
+    proposed_gba = base_bulk * (1.0 + adj_bonus_pct / 100.0)
 
-    # 3) Brownfield credit / net increase
+    # Brownfield credit / net increase
     net_increase = max(0.0, proposed_gba - existing_gba_m2)
 
-    # 4) IH (consistent with DC basis) applied to net increase
+    # IH applied to net increase (consistent with DC basis)
     ih_gba = net_increase * (ih_pct / 100.0)
     ih_gba = min(ih_gba, proposed_gba)
 
     market_gba = proposed_gba - ih_gba
-
-    # 5) DCs on market share of net increase
     market_gba_increase = net_increase - ih_gba
 
+    # DCs (market share only), PT discount on roads portion
     disc = pt_discount(pt_zone_value)
     roads_dc = market_gba_increase * ROADS_TRANSPORT_PORTION * disc
     other_dc = market_gba_increase * (DC_BASE_RATE - ROADS_TRANSPORT_PORTION)
@@ -161,10 +169,10 @@ def compute_model(
     total_potential_dc = net_increase * DC_BASE_RATE
     dc_savings = total_potential_dc - total_dc
 
-    # 6) Revenue
+    # Revenue
     gdv = (market_gba * market_price_per_m2) + (ih_gba * ih_price_per_m2)
 
-    # 7) Costs
+    # Costs
     construction_costs = proposed_gba * adj_cost_sqm
     hard_plus_dc = construction_costs + total_dc
     prof_fees = hard_plus_dc * adj_fees_rate
@@ -174,7 +182,8 @@ def compute_model(
 
     return {
         "base_bulk": base_bulk,
-        "bulk_with_bonus": bulk_with_bonus,
+        "input_bonus_pct": float(density_bonus_pct),
+        "adj_bonus_pct": float(adj_bonus_pct),   # ✅ ALWAYS present (fixes your KeyError)
         "proposed_gba": proposed_gba,
         "net_increase": net_increase,
         "ih_gba": ih_gba,
@@ -218,7 +227,6 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.metric("Residual Land Value (RLV)", f"R {res['rlv']:,.2f}")
 
-    # Incentive Effect Card
     st.success(f"""
 **🌟 Incentive Effect**  
 With **{ih_percent}% IH** and **{pt_zone}**, you save:  
@@ -232,7 +240,7 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     if heritage_overlay.enabled:
         st.info(f"""
 **🏛️ Built Heritage Overlay Active**
-- Bonus suppression: **{heritage_overlay.bulk_reduction_pct:.0f}%** → effective bonus **{res['adj_bonus_pct']:.1f}%**
+- Bonus suppression: **{heritage_overlay.bulk_reduction_pct:.0f}%** → effective bonus **{res['adj_bonus_pct']:.1f}%** (input was {res['input_bonus_pct']:.1f}%)
 - Cost uplift: **{heritage_overlay.cost_uplift_pct:.0f}%** → **R {res['adj_cost_sqm']:,.0f}/m²**
 - Fees rate uplift: **{heritage_overlay.fees_uplift_pct:.0f}%** → **{res['adj_fees_rate']*100:.2f}%**
 - Profit uplift: **{heritage_overlay.profit_uplift_pct:.0f}%** → **{res['adj_profit_rate']*100:.2f}%**
@@ -244,7 +252,6 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     )
 
 with col2:
-    # Waterfall Chart (reconciles to RLV)
     fig = go.Figure(go.Waterfall(
         name="RLV Breakdown",
         orientation="v",
