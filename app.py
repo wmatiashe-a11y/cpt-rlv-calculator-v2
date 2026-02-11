@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from dataclasses import dataclass
 
 # --- CONFIGURATION & ZONING PRESETS ---
 ZONING_PRESETS = {
@@ -15,10 +16,43 @@ DC_BASE_RATE = 514.10  # Total DC per m2
 ROADS_TRANSPORT_PORTION = 285.35
 
 IH_PRICE_PER_M2 = 15000  # capped IH price (assumption)
-PROF_FEE_RATE = 0.12     # % of (construction + DCs)
+DEFAULT_PROF_FEE_RATE = 0.12  # % of (construction + DCs)
 
 st.set_page_config(page_title="CPT RLV Calculator", layout="wide")
 st.title("🏗️ Cape Town Redevelopment: RLV & IH Sensitivity")
+
+# -----------------------
+# Heritage overlay model
+# -----------------------
+@dataclass(frozen=True)
+class HeritageOverlay:
+    enabled: bool
+    bulk_reduction_pct: float      # reduces achievable bulk (a proxy for restrictions)
+    cost_uplift_pct: float         # increases construction costs (specialist methods/materials)
+    fees_uplift_pct: float         # increases professional fees
+    profit_uplift_pct: float       # increases required profit/contingency due to approval risk
+
+
+def apply_heritage_overlay(
+    total_bulk: float,
+    base_cost_sqm: float,
+    base_fees_rate: float,
+    base_profit_rate: float,
+    overlay: HeritageOverlay,
+) -> tuple[float, float, float, float]:
+    """
+    Returns:
+      (adj_total_bulk, adj_cost_sqm, adj_fees_rate, adj_profit_rate)
+    """
+    if not overlay.enabled:
+        return total_bulk, base_cost_sqm, base_fees_rate, base_profit_rate
+
+    adj_bulk = total_bulk * (1.0 - overlay.bulk_reduction_pct / 100.0)
+    adj_cost = base_cost_sqm * (1.0 + overlay.cost_uplift_pct / 100.0)
+    adj_fees = base_fees_rate * (1.0 + overlay.fees_uplift_pct / 100.0)
+    adj_profit = base_profit_rate * (1.0 + overlay.profit_uplift_pct / 100.0)
+    return adj_bulk, adj_cost, adj_fees, adj_profit
+
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("1. Site Parameters")
@@ -35,6 +69,26 @@ st.sidebar.header("3. Financials (ZAR)")
 market_price = st.sidebar.number_input("Market Sales Price (per m2)", value=35000.0, min_value=0.0, step=500.0)
 const_cost = st.sidebar.number_input("Construction Cost (per m2)", value=17500.0, min_value=0.0, step=250.0)
 profit_margin = st.sidebar.slider("Target Profit (as % of GDV)", 10, 25, 20) / 100
+
+# --- BUILT HERITAGE OVERLAY INPUTS ---
+st.sidebar.header("4. Overlays")
+st.sidebar.subheader("🏛️ Built Heritage Overlay")
+
+heritage_enabled = st.sidebar.checkbox("Enable Built Heritage Overlay", value=False)
+
+# sensible defaults (edit any time)
+heritage_bulk_reduction = st.sidebar.slider("Bulk reduction (%)", 0, 40, 10, disabled=not heritage_enabled)
+heritage_cost_uplift = st.sidebar.slider("Construction cost uplift (%)", 0, 40, 8, disabled=not heritage_enabled)
+heritage_fees_uplift = st.sidebar.slider("Professional fees uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
+heritage_profit_uplift = st.sidebar.slider("Profit requirement uplift (%)", 0, 40, 5, disabled=not heritage_enabled)
+
+heritage_overlay = HeritageOverlay(
+    enabled=heritage_enabled,
+    bulk_reduction_pct=float(heritage_bulk_reduction),
+    cost_uplift_pct=float(heritage_cost_uplift),
+    fees_uplift_pct=float(heritage_fees_uplift),
+    profit_uplift_pct=float(heritage_profit_uplift),
+)
 
 
 # --- HELPERS ---
@@ -57,51 +111,70 @@ def compute_model(
     ih_price_per_m2: float,
     const_cost_per_m2: float,
     profit_pct_gdv: float,
+    base_prof_fee_rate: float,
+    overlay: HeritageOverlay,
 ):
     """
     Consistent assumptions:
-    - Proposed GBA = land_area * ff * (1 + density_bonus)
-    - DCs payable only on net increase (brownfield credit): max(0, proposed - existing)
-    - IH requirement applied to the *net increase* (consistent with DC logic).
-      If you want IH on total proposed, change ih_gba = proposed * ih_pct.
-    - Sales revenue based on final proposed split: market = proposed - ih_gba; IH = ih_gba
-    - Profit = profit_pct_gdv * GDV
-    - Prof fees = PROF_FEE_RATE * (construction + DCs)
+    - Base bulk = land_area * ff
+    - Density bonus increases bulk before overlay; heritage overlay then reduces achievable bulk
+    - Proposed GBA derived from (base bulk * (1 + bonus)) then adjusted by overlay bulk reduction
+    - IH applied to net increase (brownfield credit basis) to stay consistent with DCs
+    - DCs payable on market share of net increase; PT discount applied to roads portion only
+    - Profit = profit_pct_gdv * GDV (then uplifted by overlay)
+    - Prof fees rate uplifted by overlay
     - RLV = GDV - (construction + DCs + prof fees + profit)
     """
 
-    proposed_gba = land_area_m2 * ff * (1 + density_bonus_pct / 100)
+    # 1) Base + density bonus
+    base_bulk = land_area_m2 * ff
+    bulk_with_bonus = base_bulk * (1.0 + density_bonus_pct / 100.0)
 
+    # 2) Apply overlay adjustments (bulk, cost, fees rate, profit rate)
+    adj_bulk, adj_cost_sqm, adj_fees_rate, adj_profit_rate = apply_heritage_overlay(
+        total_bulk=bulk_with_bonus,
+        base_cost_sqm=const_cost_per_m2,
+        base_fees_rate=base_prof_fee_rate,
+        base_profit_rate=profit_pct_gdv,
+        overlay=overlay,
+    )
+
+    proposed_gba = adj_bulk
+
+    # 3) Brownfield credit / net increase
     net_increase = max(0.0, proposed_gba - existing_gba_m2)
 
+    # 4) IH (consistent with DC basis) applied to net increase
     ih_gba = net_increase * (ih_pct / 100.0)
-    ih_gba = min(ih_gba, proposed_gba)  # safety
+    ih_gba = min(ih_gba, proposed_gba)
 
     market_gba = proposed_gba - ih_gba
 
-    # DC logic: only on market share of net increase (IH exempt), with PT discount on roads/transport portion
+    # 5) DCs on market share of net increase
     market_gba_increase = net_increase - ih_gba
 
     disc = pt_discount(pt_zone_value)
-
     roads_dc = market_gba_increase * ROADS_TRANSPORT_PORTION * disc
     other_dc = market_gba_increase * (DC_BASE_RATE - ROADS_TRANSPORT_PORTION)
     total_dc = roads_dc + other_dc
 
     total_potential_dc = net_increase * DC_BASE_RATE
-    dc_savings = total_potential_dc - total_dc  # savings due to IH exemption + PT discount
+    dc_savings = total_potential_dc - total_dc
 
+    # 6) Revenue
     gdv = (market_gba * market_price_per_m2) + (ih_gba * ih_price_per_m2)
 
-    construction_costs = proposed_gba * const_cost_per_m2
+    # 7) Costs
+    construction_costs = proposed_gba * adj_cost_sqm
     hard_plus_dc = construction_costs + total_dc
-
-    prof_fees = hard_plus_dc * PROF_FEE_RATE
-    profit = gdv * profit_pct_gdv
+    prof_fees = hard_plus_dc * adj_fees_rate
+    profit = gdv * adj_profit_rate
 
     rlv = gdv - (hard_plus_dc + prof_fees + profit)
 
     return {
+        "base_bulk": base_bulk,
+        "bulk_with_bonus": bulk_with_bonus,
         "proposed_gba": proposed_gba,
         "net_increase": net_increase,
         "ih_gba": ih_gba,
@@ -115,6 +188,9 @@ def compute_model(
         "profit": profit,
         "rlv": rlv,
         "brownfield_credit": existing_gba_m2 > proposed_gba,
+        "adj_cost_sqm": adj_cost_sqm,
+        "adj_fees_rate": adj_fees_rate,
+        "adj_profit_rate": adj_profit_rate,
     }
 
 
@@ -132,6 +208,8 @@ res = compute_model(
     ih_price_per_m2=IH_PRICE_PER_M2,
     const_cost_per_m2=const_cost,
     profit_pct_gdv=profit_margin,
+    base_prof_fee_rate=DEFAULT_PROF_FEE_RATE,
+    overlay=heritage_overlay,
 )
 
 # --- UI DISPLAY ---
@@ -140,6 +218,7 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.metric("Residual Land Value (RLV)", f"R {res['rlv']:,.2f}")
 
+    # Incentive Effect Card
     st.success(f"""
 **🌟 Incentive Effect**  
 With **{ih_percent}% IH** and **{pt_zone}**, you save:  
@@ -149,6 +228,15 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
 
     if res["brownfield_credit"]:
         st.warning("⚠️ Existing GBA exceeds proposed GBA. Net increase is zero; no DCs payable (Brownfield Credit).")
+
+    if heritage_overlay.enabled:
+        st.info(f"""
+**🏛️ Built Heritage Overlay Active**
+- Bulk reduction: **{heritage_overlay.bulk_reduction_pct:.0f}%**
+- Cost uplift: **{heritage_overlay.cost_uplift_pct:.0f}%** → **R {res['adj_cost_sqm']:,.0f}/m²**
+- Fees rate uplift: **{heritage_overlay.fees_uplift_pct:.0f}%** → **{res['adj_fees_rate']*100:.2f}%**
+- Profit uplift: **{heritage_overlay.profit_uplift_pct:.0f}%** → **{res['adj_profit_rate']*100:.2f}%**
+""")
 
     st.caption(
         f"Proposed GBA: {res['proposed_gba']:,.0f} m²  •  Net increase: {res['net_increase']:,.0f} m²  •  "
@@ -175,8 +263,9 @@ with col2:
     fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-# Sensitivity Matrix (now uses same engine)
-st.subheader("Sensitivity Analysis: IH % vs Density Bonus (consistent engine)")
+# Sensitivity Matrix (uses same engine + overlay)
+st.subheader("Sensitivity Analysis: IH % vs Density Bonus (overlay-consistent)")
+
 ih_levels = [0, 10, 20, 30]
 bonus_levels = [0, 20, 40]
 
@@ -195,6 +284,8 @@ for ih in ih_levels:
             ih_price_per_m2=IH_PRICE_PER_M2,
             const_cost_per_m2=const_cost,
             profit_pct_gdv=profit_margin,
+            base_prof_fee_rate=DEFAULT_PROF_FEE_RATE,
+            overlay=heritage_overlay,
         )
         row.append(f"R {tmp['rlv'] / 1_000_000:.1f}M")
     matrix_data.append(row)
