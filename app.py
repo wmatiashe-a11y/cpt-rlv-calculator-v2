@@ -232,7 +232,7 @@ With **{ih_percent}% IH** and **{pt_zone}**, you save:
     if heritage_overlay.enabled:
         st.info(f"""
 **🏛️ Built Heritage Overlay Active**
-- Bulk reduction: **{heritage_overlay.bulk_reduction_pct:.0f}%**
+- Bonus suppression: **{heritage_overlay.bulk_reduction_pct:.0f}%** → effective bonus **{res['adj_bonus_pct']:.1f}%**
 - Cost uplift: **{heritage_overlay.cost_uplift_pct:.0f}%** → **R {res['adj_cost_sqm']:,.0f}/m²**
 - Fees rate uplift: **{heritage_overlay.fees_uplift_pct:.0f}%** → **{res['adj_fees_rate']*100:.2f}%**
 - Profit uplift: **{heritage_overlay.profit_uplift_pct:.0f}%** → **{res['adj_profit_rate']*100:.2f}%**
